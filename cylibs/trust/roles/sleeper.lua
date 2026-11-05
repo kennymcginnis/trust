@@ -1,5 +1,8 @@
+local ConditionalCondition = require('cylibs/conditions/conditional')
 local DisposeBag = require('cylibs/events/dispose_bag')
 local MobFilter = require('cylibs/battle/monsters/mob_filter')
+local PartyClaimedCondition = require('cylibs/conditions/party_claimed')
+local UnclaimedCondition = require('cylibs/conditions/unclaimed')
 local monster_util = require('cylibs/util/monster_util')
 local spell_util = require('cylibs/util/spell_util')
 
@@ -7,9 +10,9 @@ local Sleeper = setmetatable({}, {__index = Role })
 Sleeper.__index = Sleeper
 
 state.AutoSleepMode = M{['description'] = 'Auto Sleep Mode', 'Off', 'Auto'}
-state.AutoSleepMode:set_description('Auto', "Automatically try to sleep large groups of monsters.")
+state.AutoSleepMode:set_description('Auto', "Automatically sleep linked adds on bard, or large groups of monsters on black mage.")
 
-function Sleeper.new(action_queue, sleep_spells, min_mobs_to_sleep)
+function Sleeper.new(action_queue, sleep_spells, min_mobs_to_sleep, sleep_adds_only)
     local self = setmetatable(Role.new(action_queue), Sleeper)
 
     self:set_sleep_spells(sleep_spells)
@@ -17,6 +20,7 @@ function Sleeper.new(action_queue, sleep_spells, min_mobs_to_sleep)
     self.dispose_bag = DisposeBag.new()
     self.last_sleep_time = os.time()
     self.min_mobs_to_sleep = min_mobs_to_sleep or 2
+    self.sleep_adds_only = sleep_adds_only or false
 
     return self
 end
@@ -47,7 +51,18 @@ function Sleeper:check_sleep()
         NotCondition.new(L{ HasDebuffCondition.new('sleep') })
     }
 
-    local targets = self.mob_filter:get_nearby_mobs(L{ MobFilter.Type.Aggroed, MobFilter.Type.Unclaimed }):filter(function(mob)
+    local filters = L{ MobFilter.Type.Aggroed, MobFilter.Type.Unclaimed }
+    local current_target
+    if self.sleep_adds_only then
+        current_target = self:get_target()
+        filters = L{ MobFilter.Type.Aggroed, ConditionalCondition.new(L{
+            UnclaimedCondition.new(), PartyClaimedCondition.new(true),
+        }, Condition.LogicalOperator.Or) }
+    end
+    local targets = self.mob_filter:get_nearby_mobs(filters):filter(function(mob)
+        if current_target and mob.id == current_target:get_id() then
+            return false
+        end
         local monster = self:get_alliance():get_target_by_index(mob.index)
         if monster then
             return Condition.check_conditions(conditions, mob.index)
@@ -58,8 +73,8 @@ function Sleeper:check_sleep()
 
     if targets:length() >= self.min_mobs_to_sleep then
         for sleep_spell in self.sleep_spells:it() do
-            if Condition.check_conditions(sleep_spell:get_conditions(), windower.ffxi.get_player().index) then
-                self:cast_spell(sleep_spell, targets[1].index)
+                if Condition.check_conditions(sleep_spell:get_conditions(), windower.ffxi.get_player().index)
+                    and self:cast_spell(sleep_spell, targets[1].index) then
                 return
             end
         end
@@ -81,7 +96,9 @@ function Sleeper:cast_spell(spell, target_index)
         sleep_action.priority = ActionPriority.highest
 
         self.action_queue:push_action(sleep_action, true)
+        return true
     end
+    return false
 end
 
 function Sleeper:set_sleep_spells(sleep_spells)

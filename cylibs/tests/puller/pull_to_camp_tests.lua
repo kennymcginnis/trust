@@ -59,6 +59,8 @@ end
 
 local Gambiter = {
     on_add = function() end,
+    is_enabled = function() return true end,
+    get_priority = function() return 0 end,
     get_action_identifier = function() return 'puller_action' end,
     is_gambit_satisfied = function() return true, 'target' end,
 }
@@ -84,6 +86,9 @@ local modules = {
             return { x = x, y = y, z = z, distance = distance }
         end,
     },
+    ['cylibs/actions/runto'] = { new = function(target_index, distance)
+        return { target_index = target_index, distance = distance }
+    end },
 }
 function require(name)
     if name == 'cylibs/trust/roles/puller' or name == 'cylibs/trust/roles/attacker'
@@ -145,6 +150,53 @@ local function fixture()
 end
 
 local tests = {}
+local function distant_pull_fixture(distance)
+    local puller, player, queue, ended = fixture()
+    local mob = { id = 1, index = 1, distance = distance * distance }
+    puller.target = { get_mob = function() return mob end }
+    puller.check_delay = function() return true end
+    puller.is_valid_target = function() return true end
+    puller.pull_abilities = { Auto = L{ {
+        isEnabled = function() return true end,
+        getAbility = function() return { get_range = function() return 20 end } end,
+    } } }
+    player.current_distance = 1
+    UnclaimedCondition = { new = function() return {} end }
+    Condition = { check_conditions = function() return true end }
+    return puller, player, queue, ended, mob
+end
+
+function tests.distant_auto_pull_moves_into_attack_range_without_engaging_or_returning()
+    local puller, _, queue, ended = distant_pull_fixture(24)
+    local camp = puller:get_camp_position()
+    assert(puller:approach_pull_target(), 'an auto-pull target at 24 yalms must trigger movement into 20-yalm attack range')
+    assert(#queue.actions == 1 and queue.actions[1].target_index == 1, 'movement must target the selected mob')
+    assert(queue.actions[1].distance < 20, 'movement must stop just inside pull ability range')
+    assert(queue.actions[1].identifier == 'Approach pull target', 'approaching must be distinct from the actual pull action')
+    ended:trigger({ getidentifier = function() return 'Approach pull target' end }, true)
+    assert(not puller.returning_to_camp, 'movement completion must not trigger return before the pull action fires')
+    assert(puller:get_camp_position() == camp, 'approaching must not reset camp')
+end
+
+function tests.auto_pull_movement_respects_range_modes_and_pending_actions()
+    local puller, player, queue, _, mob = distant_pull_fixture(19)
+    assert(not puller:approach_pull_target(), 'must pull directly when already in range')
+    mob.distance = 24 * 24
+    state.PullActionMode.value = 'Target'
+    assert(not puller:approach_pull_target(), 'Target mode must remain unchanged')
+    state.PullActionMode.value = 'Auto'
+    player.get_status = function() return 'Engaged' end
+    assert(not puller:approach_pull_target(), 'must not abandon an existing fight')
+    player.get_status = function() return 'Idle' end
+    puller.returning_to_camp = true
+    assert(not puller:approach_pull_target(), 'must not approach while returning to camp')
+    puller.returning_to_camp = false
+    queue.pending = 'Approach pull target'
+    assert(puller:approach_pull_target() and #queue.actions == 0, 'must not queue duplicate movement')
+    queue.pending = 'puller_action'
+    assert(not puller:approach_pull_target(), 'must not approach during an actual pull')
+end
+
 function tests.detection_range_is_independent_of_pull_ability_range()
     local puller = fixture()
     puller.distance = 50

@@ -12,6 +12,7 @@ local PartyClaimedCondition = require('cylibs/conditions/party_claimed')
 local PartyLeaderCondition = require('cylibs/conditions/party_leader')
 local PartyTargetedCondition = require('cylibs/conditions/party_targeted')
 local PullTargetUtil = require('cylibs/util/pull_target_util')
+local RunToAction = require('cylibs/actions/runto')
 local RunToLocationAction = require('cylibs/actions/runtolocation')
 local TargetIdsCondition = require('cylibs/conditions/target_ids')
 local TargetNamesCondition = require('cylibs/conditions/target_names')
@@ -114,8 +115,53 @@ function Puller:tic(_, _)
 
     logger.notice(self.__class, 'tic', 'target_index', self.target_index or 'none')
 
-    self:return_to_camp(self.returning_to_camp and self:is_pull_to_camp_enabled())
+    self:return_to_camp(self.returning_to_camp and (state.AutoCampMode.value == 'Auto' or self:is_pull_to_camp_enabled()))
     self:check_target()
+end
+
+function Puller:check_gambits(gambits, param, ignore_delay)
+    if self:approach_pull_target() then
+        return
+    end
+    Gambiter.check_gambits(self, gambits, param, ignore_delay)
+end
+
+function Puller:approach_pull_target()
+    if not self:is_enabled() or state.PullActionMode.value ~= 'Auto' or state.AutoPullMode.value == 'Off'
+            or self.returning_to_camp or self:get_party():get_player():get_status() ~= 'Idle'
+            or not self:check_delay() or self.action_queue:has_action(self:get_action_identifier()) then
+        return false
+    end
+    if self.action_queue:has_action('Approach pull target') then
+        return true
+    end
+    local target = self:get_pull_target()
+    local mob = target and target:get_mob()
+    if not self:is_valid_target(mob) or not Condition.check_conditions(L{ UnclaimedCondition.new() }, mob.index) then
+        return false
+    end
+    local range = 0
+    for gambit in self.pull_abilities.Auto:it() do
+        if gambit:isEnabled() then
+            range = math.max(range, gambit:getAbility():get_range())
+        end
+    end
+    if range <= 0 or math.sqrt(mob.distance) <= range then
+        return false
+    end
+    local action = RunToAction.new(mob.index, math.max(0.1, range - 0.5))
+    action.identifier = 'Approach pull target'
+    action.priority = self:get_priority()
+    action.validate = function()
+        local current_target = self:get_pull_target()
+        local current_mob = current_target and current_target:get_mob()
+        return state.AutoPullMode.value ~= 'Off' and state.PullActionMode.value == 'Auto'
+                and not self.returning_to_camp and self:get_party():get_player():get_status() == 'Idle'
+                and current_mob and current_mob.index == mob.index and self:is_valid_target(current_mob)
+                and Condition.check_conditions(L{ UnclaimedCondition.new() }, current_mob.index)
+    end
+    self.action_queue:push_action(action, true)
+    return true
 end
 
 function Puller:is_gambit_satisfied(gambit, param, resolved_targets)
