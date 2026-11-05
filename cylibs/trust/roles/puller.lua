@@ -79,6 +79,9 @@ function Puller:on_add()
     end), state.AutoPullMode:on_state_change())
 
     self.dispose_bag:add(self.action_queue:on_action_end():addAction(function(action, success)
+        if success and action:getidentifier() == 'Return to camp' then
+            self.returning_to_camp = false
+        end
         if success and action:getidentifier() == self:get_action_identifier() and self:is_pull_to_camp_enabled() then
             self.returning_to_camp = true
             self:return_to_camp(true)
@@ -89,6 +92,9 @@ function Puller:on_add()
         if self:get_target() and self:get_target():get_id() == mob_id then
             logger.notice(self.__class, 'mob_ko', mob_name, self:get_target():get_mob().hpp, status)
             CooldownCondition.set_timestamp('last_mob_ko', os.time())
+            if state.AutoCampMode.value == 'Auto' then
+                self.returning_to_camp = true
+            end
             self:set_pull_target(nil) -- this is necessary otherwise get_target() returns valid until next loop
             self:check_target(L{ mob_id })
         end
@@ -231,19 +237,11 @@ function Puller:is_valid_target(target, target_id_blacklist)
         return false
     end
 
-    local pull_abilities = self.pull_abilities[state.PullActionMode.value]
-
-    local max_pull_ability_range = 0
-    for gambit in pull_abilities:it() do
-        max_pull_ability_range = math.max(max_pull_ability_range, gambit:getAbility():get_range())
-    end
-    max_pull_ability_range = math.min(max_pull_ability_range, self.distance)
-
     local conditions = L{
         MinHitPointsPercentCondition.new(1),
         ConditionalCondition.new(L{
             PartyClaimedCondition.new(true),
-            ConditionalCondition.new(L{ UnclaimedCondition.new(), MaxDistanceCondition.new(max_pull_ability_range) }, Condition.LogicalOperator.And),
+            ConditionalCondition.new(L{ UnclaimedCondition.new(), MaxDistanceCondition.new(self.distance or 25, nil, self:get_camp_position()) }, Condition.LogicalOperator.And),
         }, Condition.LogicalOperator.Or),
         NotCondition.new(L{ TargetNamesCondition.new(self.blacklist) }),
     }
@@ -409,7 +407,7 @@ function Puller:allows_multiple_actions()
 end
 
 function Puller:return_to_camp(allow_pull_target)
-    if state.AutoCampMode.value == 'Off' or self:get_pull_target() ~= nil and not allow_pull_target
+    if not self.returning_to_camp or state.AutoCampMode.value == 'Off' or self:get_pull_target() ~= nil and not allow_pull_target
             or self:get_party():get_player():get_status() == 'Engaged' or self:get_camp_position() == nil then
         return false
     end

@@ -22,6 +22,7 @@ function L(values)
             return self[index]
         end
     end
+    function values:length() return #self end
     function values:map(transform)
         local result = L{}
         for _, value in ipairs(self) do table.insert(result, transform(value)) end
@@ -64,6 +65,11 @@ local Gambiter = {
 local original_require = require
 local modules = {
     ['cylibs/trust/roles/gambiter'] = Gambiter,
+    ['cylibs/conditions/party_claimed'] = { new = function() return { kind = 'claimed' } end },
+    ['cylibs/conditions/target_names'] = { new = function(names) return { kind = 'names', names = names } end },
+    ['cylibs/conditions/conditional'] = { new = function(conditions, operator)
+        return { conditions = conditions, operator = operator }
+    end },
     ['cylibs/gambits/gambit'] = { new = function() return {} end },
     ['cylibs/gambits/gambit_target'] = { TargetType = { Enemy = 'Enemy', Self = 'Self' } },
     ['cylibs/battle/approach'] = { new = function() return {} end },
@@ -139,6 +145,95 @@ local function fixture()
 end
 
 local tests = {}
+function tests.detection_range_is_independent_of_pull_ability_range()
+    local puller = fixture()
+    puller.distance = 50
+    puller.blacklist = L{}
+    puller.max_num_targets = 1
+    puller.pull_abilities = { Auto = L{ { getAbility = function()
+        return { get_range = function() return 20 end }
+    end } } }
+    local mob = { id = 2, index = 2, name = 'Bat', hpp = 100, status = 0, distance = 40 }
+    MinHitPointsPercentCondition = { new = function(value) return { kind = 'hp', value = value } end }
+    UnclaimedCondition = { new = function() return { kind = 'unclaimed' } end }
+    MaxDistanceCondition = { new = function(value) return { kind = 'distance', value = value } end }
+    NotCondition = { new = function(conditions) return { kind = 'not', conditions = conditions } end }
+    Condition = { LogicalOperator = { And = 'And', Or = 'Or' } }
+    local function check(condition)
+        if condition.kind == 'not' then return not check(condition.conditions[1]) end
+        if condition.conditions then
+            for _, child in ipairs(condition.conditions) do
+                local success = check(child)
+                if condition.operator == 'Or' and success then return true end
+                if condition.operator == 'And' and not success then return false end
+            end
+            return condition.operator == 'And'
+        end
+        if condition.kind == 'hp' then return mob.hpp >= condition.value end
+        if condition.kind == 'distance' then return mob.distance <= condition.value end
+        if condition.kind == 'unclaimed' then return not mob.claimed end
+        if condition.kind == 'claimed' then return mob.claimed == true end
+        if condition.kind == 'names' then return condition.names:contains(mob.name) end
+        error('Unexpected condition')
+    end
+    Condition.check_conditions = function(conditions)
+        for _, condition in ipairs(conditions) do
+            if not check(condition) then return false end
+        end
+        return true
+    end
+    puller.check_delay = function() return true end
+    puller.get_all_targets = function() return L{ mob } end
+    Monster = { new = function(id) return { id = id } end }
+    local target = puller:get_next_target()
+    assert(target and target.id == mob.id, 'bat at 40 yalms must be detectable with detection range 50 and attack range 20')
+    mob.distance = 51
+    assert(not puller:get_next_target(), 'mobs outside the detection radius must remain excluded')
+    mob.distance = 40
+    puller.blacklist = L{ 'Bat' }
+    assert(not puller:get_next_target(), 'detection must continue respecting the blacklist')
+end
+
+function tests.manual_departure_after_arriving_at_camp_does_not_restart_return()
+    for _, mode in ipairs({ 'Auto', 'Pull' }) do
+        local puller, player, queue = fixture()
+        state.AutoCampMode.value = mode
+        logger = { notice = function() end }
+        puller.get_next_target = function() return nil end
+        puller.set_pull_target = function(self, target) self.target = target end
+        local camp = puller:get_camp_position()
+        puller.returning_to_camp = true
+        player.current_distance = 1
+        puller:tic()
+        player.current_distance = 10
+        puller:tic()
+        puller:tic()
+        assert(#queue.actions == 0, mode..' camp mode must allow manual departure after arrival even without pull targets')
+        assert(puller:get_camp_position() == camp, 'manual departure must not move the saved camp')
+    end
+end
+
+function tests.after_battle_return_is_armed_by_kill_and_finished_by_arrival()
+    local puller, player, queue, ended = fixture()
+    state.AutoCampMode.value = 'Auto'
+    logger = { notice = function() end }
+    puller.target = {
+        get_id = function() return 1 end,
+        get_mob = function() return { name = 'Bat', hpp = 0 } end,
+    }
+    puller.get_target = function(self) return self.target end
+    puller.get_next_target = function() return nil end
+    puller.set_pull_target = function(self, target) self.target = target end
+    WindowerEvents.MobKO:trigger(1, 'Bat', 2)
+    assert(puller.returning_to_camp and #queue.actions == 1, 'a kill must still trigger the configured after-battle return')
+    player.current_distance = 1
+    ended:trigger({ getidentifier = function() return 'Return to camp' end }, true)
+    assert(not puller.returning_to_camp, 'arrival must release the return phase immediately')
+    player.current_distance = 10
+    puller:tic()
+    assert(#queue.actions == 1, 'manual departure after battle return must not trigger another return')
+end
+
 function tests.successful_pull_returns_with_target_and_keeps_camp()
     local puller, _, queue, ended = fixture()
     local camp = puller:get_camp_position()
