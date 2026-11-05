@@ -21,7 +21,9 @@ function PullTrustCommands.new(trust, trust_settings, action_queue, puller)
     self:add_command('aggroed', function(_) return self:handle_set_mode('AutoPullMode', 'Aggroed')  end, 'Automatically pull any monster aggressive to the party')
     self:add_command('all', function(_) return self:handle_set_mode('AutoPullMode', 'All')  end, 'Automatically pull nearby monsters')
     self:add_command('off', function(_) return self:handle_set_mode('AutoPullMode', 'Off')  end, 'Disable pulling')
-    self:add_command('camp', self.handle_camp, 'Automatically return to camp after battle')
+    self:add_command('camp', self.handle_camp, 'Set camp and return after battle, or after pulling with camp pull', L{
+        PickerConfigItem.new('mode', 'auto', L{ 'auto', 'pull' }, nil, "Camp Mode")
+    })
     self:add_command('ignore', self.handle_ignore, 'Add a mob to the blacklist')
     self:add_command('delay', self.handle_delay, 'Set delay between pulls')
 
@@ -60,18 +62,24 @@ function PullTrustCommands:get_settings()
     return self.trust_settings:getSettings()[state.MainTrustSettingsMode.value]
 end
 
--- // trust pull camp
-function PullTrustCommands:handle_camp(_)
+-- // trust pull camp [auto|pull]
+function PullTrustCommands:handle_camp(_, mode)
     local success
     local message
 
-    handle_set('AutoCampMode', 'Auto')
+    mode = mode and mode:lower() or 'auto'
+    if mode ~= 'auto' and mode ~= 'pull' then
+        return false, 'Usage: // trust pull camp [auto|pull]'
+    end
+
+    handle_set('AutoCampMode', mode == 'pull' and 'Pull' or 'Auto')
 
     local position = ffxi_util.get_mob_position(windower.ffxi.get_player().name)
-    self:get_puller():set_camp_position(V{ position[1], position[2] })
+    self:get_puller():set_camp_position(V{ position[1], position[2], position[3] })
 
     success = true
-    message = "Return to the current position after battle"
+    message = mode == 'pull' and "Return to the current position after pulling, before engaging"
+        or "Return to the current position after battle"
 
     return success, message
 end

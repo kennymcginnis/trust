@@ -72,6 +72,17 @@ function Attacker:target_change(target_index)
     self:check_gambits()
 end
 
+function Attacker:set_puller(puller)
+    self.puller = puller
+end
+
+function Attacker:is_gambit_satisfied(gambit, param, resolved_targets)
+    if self.puller and self.puller:should_wait_to_engage() then
+        return false, nil
+    end
+    return Gambiter.is_gambit_satisfied(self, gambit, param, resolved_targets)
+end
+
 function Attacker:set_attacker_settings(attacker_settings)
     self.engage_distance = attacker_settings.EngageDistance or 30
 

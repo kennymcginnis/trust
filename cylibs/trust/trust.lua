@@ -205,6 +205,11 @@ function Trust:add_role(role)
 	end
 	self.roles:add(role)
 
+	local attacker = self:role_with_type("attacker")
+	if attacker then
+		attacker:set_puller(self:role_with_type("puller"))
+	end
+
 	if role.on_add then
 		role:set_player(self.player)
 		role:set_alliance(self.alliance)
@@ -227,6 +232,10 @@ function Trust:remove_role(role)
 		role:set_job(nil)
 	end
 	self.roles = self.roles:filter(function(r) return r:get_type() ~= role:get_type() end)
+	local attacker = self:role_with_type("attacker")
+	if attacker then
+		attacker:set_puller(self:role_with_type("puller"))
+	end
 end
 
 function Trust:replace_role(role_type, new_role)

@@ -26,8 +26,9 @@ state.AutoPullMode:set_description('Auto', "Pull monsters for the party from the
 state.AutoPullMode:set_description('Aggroed', "Pull any monster aggressive to the party.")
 state.AutoPullMode:set_description('All', "Pull any monster that's nearby.")
 
-state.AutoCampMode = M{['description'] = 'Return to Camp after Battle', 'Off', 'Auto'}
+state.AutoCampMode = M{['description'] = 'Return to Camp', 'Off', 'Auto', 'Pull'}
 state.AutoCampMode:set_description('Auto', "Return to camp after battle (set with // trust pull camp).")
+state.AutoCampMode:set_description('Pull', "Return to camp after pulling, before engaging (set with // trust pull camp pull).")
 
 state.PullActionMode = M{['description'] = 'Pull Actions', 'Auto', 'Target', 'Approach'}
 state.PullActionMode:set_description('Auto', "Pull with pull actions in settings.")
@@ -73,8 +74,16 @@ function Puller:on_add()
     on_pull_mode_changed(state.AutoPullMode.value)
 
     self.dispose_bag:add(state.AutoPullMode:on_state_change():addAction(function(_, new_value)
+        self.returning_to_camp = false
         on_pull_mode_changed(new_value)
     end), state.AutoPullMode:on_state_change())
+
+    self.dispose_bag:add(self.action_queue:on_action_end():addAction(function(action, success)
+        if success and action:getidentifier() == self:get_action_identifier() and self:is_pull_to_camp_enabled() then
+            self.returning_to_camp = true
+            self:return_to_camp(true)
+        end
+    end), self.action_queue:on_action_end())
 
     self.dispose_bag:add(WindowerEvents.MobKO:addAction(function(mob_id, mob_name, status)
         if self:get_target() and self:get_target():get_id() == mob_id then
@@ -99,8 +108,15 @@ function Puller:tic(_, _)
 
     logger.notice(self.__class, 'tic', 'target_index', self.target_index or 'none')
 
-    self:return_to_camp()
+    self:return_to_camp(self.returning_to_camp and self:is_pull_to_camp_enabled())
     self:check_target()
+end
+
+function Puller:is_gambit_satisfied(gambit, param, resolved_targets)
+    if self:is_pull_to_camp_enabled() and self.returning_to_camp then
+        return false, nil
+    end
+    return Gambiter.is_gambit_satisfied(self, gambit, param, resolved_targets)
 end
 
 function Puller:target_change(target_index)
@@ -110,7 +126,7 @@ function Puller:target_change(target_index)
 end
 
 function Puller:check_target(target_id_blacklist)
-    if state.AutoPullMode.value == 'Off' then
+    if state.AutoPullMode.value == 'Off' or self.returning_to_camp and self:is_pull_to_camp_enabled() then
         return
     end
 
@@ -256,6 +272,7 @@ function Puller:set_pull_settings(pull_settings)
     self.blacklist = pull_settings.Blacklist
     self.delay = pull_settings.Delay or 0
     self.mob_filter = MobFilter.new(self:get_alliance(), self.distance or 25, nil, self.blacklist)
+    self.mob_filter:set_center_position(self.camp_position)
     if pull_settings.RandomizeTarget then
         self.max_num_targets = 6
     else
@@ -356,11 +373,27 @@ function Puller:get_target_ids()
 end
 
 function Puller:set_camp_position(position)
+    self.camp_position = position
+    self.returning_to_camp = false
     self.mob_filter:set_center_position(position)
 end
 
 function Puller:get_camp_position()
-    return self.mob_filter:get_center_position()
+    return self.camp_position
+end
+
+function Puller:is_pull_to_camp_enabled()
+    return state.AutoCampMode.value == 'Pull' and state.AutoPullMode.value ~= 'Off'
+            and state.PullActionMode.value == 'Auto' and self:get_camp_position() ~= nil
+end
+
+function Puller:should_wait_to_engage()
+    if not self:is_pull_to_camp_enabled() then
+        return false
+    end
+    local camp_position = self:get_camp_position()
+    return self.action_queue:has_action(self:get_action_identifier())
+            or self:get_party():get_player():distance(camp_position[1], camp_position[2]) > 2
 end
 
 function Puller:get_cooldown()
@@ -375,8 +408,8 @@ function Puller:allows_multiple_actions()
     return false
 end
 
-function Puller:return_to_camp()
-    if state.AutoCampMode.value == 'Off' or self:get_pull_target() ~= nil
+function Puller:return_to_camp(allow_pull_target)
+    if state.AutoCampMode.value == 'Off' or self:get_pull_target() ~= nil and not allow_pull_target
             or self:get_party():get_player():get_status() == 'Engaged' or self:get_camp_position() == nil then
         return false
     end
@@ -394,6 +427,8 @@ function Puller:return_to_camp()
         return_to_camp_action.identifier = "Return to camp"
 
         self.action_queue:push_action(return_to_camp_action, true)
+    else
+        self.returning_to_camp = false
     end
 
     return true
