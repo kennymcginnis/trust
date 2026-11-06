@@ -88,7 +88,10 @@ local modules = {
     ['cylibs/conditions/cooldown'] = { set_timestamp = function() end },
     ['cylibs/util/pull_target_util'] = { get_id = function(value) return value end },
     ['cylibs/battle/monsters/mob_filter'] = { Type = { PartyClaimed = 'claimed', Unclaimed = 'unclaimed' }, new = function()
-        return { set_center_position = function(self, position) self.position = position end }
+        return {
+            set_center_position = function(self, position) self.position = position end,
+            get_aggroed_mobs = function() return L{} end,
+        }
     end },
     ['cylibs/actions/runtolocation'] = {
         new = function(x, y, z, distance)
@@ -163,6 +166,247 @@ local function fixture()
 end
 
 local tests = {}
+local function pull_point_fixture()
+    local puller, player, queue, ended = fixture()
+    player.position = { 10, 20, 0 }
+    player.distance = function(self, horizontal, vertical)
+        return math.sqrt((self.position[1] - horizontal)^2 + (self.position[2] - vertical)^2)
+    end
+    puller.check_delay = function() return true end
+    puller.is_valid_target = function(_, mob) return mob ~= nil end
+    puller.get_all_targets = function() return L{} end
+    UnclaimedCondition = { new = function() return { kind = 'unclaimed' } end }
+    Condition = { check_conditions = function(conditions) return conditions[1].kind ~= 'aggroed' end }
+    puller.pull_abilities = { Auto = L{ {
+        isEnabled = function() return true end,
+        getAbility = function() return { get_range = function() return 20 end } end,
+    } } }
+    return puller, player, queue, ended
+end
+
+function tests.pull_point_moves_only_to_saved_position_before_pulling()
+    local puller, player, queue = pull_point_fixture()
+    local camp = puller:get_camp_position()
+    local point = { 20, 20, 0 }
+    puller:set_pull_point(point)
+    assert(puller:move_to_pull_point(), 'a saved point must enable outbound movement even without a selected mob')
+    local action = queue.actions[1]
+    assert(action.x == 20 and action.y == 20 and action.identifier == 'Move to pull point', 'movement must use the fixed point, never the mob location')
+    assert(action.revalidate_while_running and action:validate(), 'outbound movement must continuously validate')
+    assert(not puller:is_gambit_satisfied({}), 'pull actions must wait until the saved point is reached')
+    queue.pending = 'Move to pull point'
+    puller:move_to_pull_point()
+    assert(#queue.actions == 1, 'outbound movement must not be duplicated')
+    queue.pending = nil
+    player.position = point
+    assert(not puller:move_to_pull_point(), 'arrival must release the pull action, not start more movement')
+    assert(puller:is_gambit_satisfied({}), 'pulling must resume at the saved point')
+    assert(puller:get_camp_position() == camp, 'outbound movement must not overwrite camp')
+end
+
+function tests.outbound_stops_and_pulls_as_soon_as_the_selected_mob_is_in_range()
+    local puller, player, queue, ended = pull_point_fixture()
+    local point = { 20, 20, 0 }
+    local camp = puller:get_camp_position()
+    local mob = { id = 1, index = 1, x = 32, y = 20, distance = 484, hpp = 100, status = 0 }
+    puller.target = { get_mob = function() return mob end }
+    puller:set_pull_point(point)
+    assert(puller:move_to_pull_point(), 'outbound movement must begin while the mob is outside pull range')
+    local movement = queue.actions[1]
+    assert(movement:validate())
+    assert(not puller:is_gambit_satisfied({}), 'out-of-range pulling must wait')
+    player.position = { 14, 20, 0 }
+    mob.distance = 324
+    assert(not movement:validate(), 'movement must stop when the mob enters pull range before reaching the limit')
+    assert(not puller:move_to_pull_point(), 'an in-range mob must prevent further outbound movement')
+    assert(puller:is_gambit_satisfied({}), 'pull actions must be allowed before reaching the saved point')
+    ended:trigger({ getidentifier = function() return 'puller_action' end }, true)
+    assert(queue.actions[2].identifier == 'Return to camp' and queue.actions[2].x == 10, 'an early pull must still return to camp')
+    assert(puller:get_pull_point() == point and puller:get_camp_position() == camp, 'early pulling must not move either saved position')
+end
+
+function tests.an_in_range_configured_mob_can_replace_an_out_of_range_target()
+    local puller, _, queue = pull_point_fixture()
+    puller:set_pull_point({ 20, 20, 0 })
+    local distant = { id = 1, index = 1, x = 38, y = 20, distance = 784, hpp = 100, status = 0 }
+    local nearby = { id = 2, index = 2, x = 25, y = 20, distance = 225, hpp = 100, status = 0 }
+    puller.target = { get_mob = function() return distant end }
+    puller.get_all_targets = function() return L{ distant, nearby } end
+    Monster = { new = function(id)
+        assert(id == 2)
+        return { get_mob = function() return nearby end }
+    end }
+    puller.set_pull_target = function(self, target) self.target = target end
+    assert(not puller:move_to_pull_point(), 'a configured mob already in range must avoid outbound travel')
+    assert(puller:get_pull_target():get_mob().id == 2, 'the reachable configured mob must become the pull target')
+    assert(#queue.actions == 0 and puller:is_gambit_satisfied({}), 'the pull must be allowed immediately without a movement action')
+end
+
+function tests.early_pull_detection_follows_the_player_not_only_the_travel_limit()
+    local puller = pull_point_fixture()
+    puller:set_pull_point({ 35, 20, 0 })
+    assert(puller:get_pull_origin() == nil, 'pull-point detection must use current player position throughout the route')
+    local mob = { id = 3, index = 3, x = 5, y = 20, distance = 25, hpp = 100, status = 0 }
+    puller.get_all_targets = function() return L{ mob } end
+    Monster = { new = function(id) return { id = id } end }
+    local target = puller:get_next_target()
+    assert(target and target.id == 3, 'a mob already in range near camp must remain selectable even outside the limit point radius')
+end
+
+function tests.pull_point_cancellation_and_singing_stop_outbound_movement()
+    local puller, player, queue = pull_point_fixture()
+    local point = { 20, 20, 0 }
+    puller:set_pull_point(point)
+    assert(puller:move_to_pull_point())
+    local action = queue.actions[1]
+    queue.is_singing = true
+    assert(not action:validate() and not puller:move_to_pull_point(), 'singing must block existing and new outbound movement')
+    queue.is_singing = false
+    state.AutoPullMode.value = 'Off'
+    assert(not action:validate(), 'disabled pulling must stop outbound movement')
+    state.AutoPullMode.value = 'Auto'
+    player.get_status = function() return 'Engaged' end
+    assert(not action:validate(), 'engagement must stop outbound movement')
+    player.get_status = function() return 'Idle' end
+    puller:set_pull_point(nil)
+    assert(not action:validate(), 'clearing the point must stop the old outbound action')
+    assert(puller:get_camp_position()[1] == 10, 'clearing the point must retain camp')
+end
+
+function tests.successful_pull_from_point_returns_to_camp_without_resetting_positions()
+    local puller, player, queue, ended = pull_point_fixture()
+    local point = { 20, 20, 0 }
+    local camp = puller:get_camp_position()
+    puller:set_pull_point(point)
+    player.position = point
+    puller.target = { get_mob = function() return { id = 1, index = 1, hpp = 100, status = 1 } end }
+    ended:trigger({ getidentifier = function() return 'puller_action' end }, true)
+    assert(queue.actions[1].identifier == 'Return to camp' and queue.actions[1].x == 10, 'successful pulls must return to camp, not the pull point')
+    assert(not puller:move_to_pull_point(), 'returning must not restart outbound movement')
+    assert(puller:get_camp_position() == camp and puller:get_pull_point() == point, 'both saved positions must survive each pull')
+end
+
+function tests.pull_point_selects_only_mobs_reachable_from_that_point()
+    local puller = pull_point_fixture()
+    puller:set_pull_point({ 20, 20, 0 })
+    puller.target_names = L{ 'Bat', 'Crab' }
+    puller.target_ids = L{}
+    local mobs = L{
+        { id = 1, index = 1, name = 'Bat', x = 45, y = 20, distance = 1225 },
+        { id = 2, index = 2, name = 'Crab', x = 25, y = 20, distance = 225 },
+    }
+    puller.get_all_targets = function() return mobs end
+    puller.is_valid_target = function() return true end
+    Monster = { new = function(id) return { id = id } end }
+    assert(puller:get_next_target().id == 2, 'an unreachable preferred mob must not prevent a reachable pull')
+    mobs[2].x, mobs[2].distance = 50, 1600
+    assert(puller:get_next_target() == nil, 'no mob in point range must mean waiting, not chasing')
+    mobs[1].x, mobs[1].distance = 40, 900
+    mobs[2].x, mobs[2].distance = 38, 784
+    assert(puller:get_next_target().id == 2, 'point-range selection must reserve room for stopping short of the saved point')
+end
+
+function tests.an_unselected_aggroed_add_cancels_outbound_and_becomes_the_return_target()
+    local puller, player, queue = pull_point_fixture()
+    puller:set_pull_point({ 20, 20, 0 })
+    local fresh = { id = 1, index = 1, hpp = 100, status = 0 }
+    local add = { id = 2, index = 2, hpp = 100, status = 1 }
+    local aggroed = L{}
+    puller.target = { get_mob = function() return fresh end }
+    puller.outbound_mob_filter = { get_aggroed_mobs = function() return aggroed end }
+    assert(puller:move_to_pull_point())
+    local outbound = queue.actions[1]
+    player.position = { 15, 20, 0 }
+    aggroed = L{ add }
+    assert(not outbound:validate(), 'an unselected add must invalidate current movement immediately')
+    Monster = { new = function(id)
+        assert(id == 2)
+        return { get_mob = function() return add end }
+    end }
+    puller.set_pull_target = function(self, target) self.target = target end
+    assert(puller:move_to_pull_point(), 'the add must take over the return workflow')
+    assert(puller:get_pull_target():get_mob().id == 2 and puller:should_wait_for_first_hit(), 'the first-hit pause must follow the aggroed add, not the fresh target')
+    assert(#queue.actions == 2 and queue.actions[2].identifier == 'Return to camp', 'the next action must return, not advance')
+end
+
+function tests.pull_point_command_saves_clears_and_validates_without_changing_camp()
+    local puller = pull_point_fixture()
+    local camp = puller:get_camp_position()
+    local commands = setmetatable({ get_puller = function() return puller end }, PullCommands)
+    V = function(value) return value end
+    ffxi_util = { get_mob_position = function() return { 20, 20, 0 } end }
+    windower.ffxi.get_player = function() return { name = 'Player' } end
+    assert(commands:handle_point(nil), 'point command must save the current position')
+    assert(puller:get_pull_point()[1] == 20 and puller:get_camp_position() == camp)
+    assert(not commands:handle_point(nil, 'invalid'), 'unknown arguments must not change the point')
+    ffxi_util.get_mob_position = function() return { 60, 20, 0 } end
+    assert(not commands:handle_point(nil), 'points beyond the safe return distance must be rejected')
+    assert(puller:get_pull_point()[1] == 20, 'rejected positions must leave the saved point unchanged')
+    assert(commands:handle_point(nil, 'clear'))
+    assert(puller:get_pull_point() == nil and puller:get_camp_position() == camp, 'clear must only remove the pull point')
+end
+
+function tests.aggro_during_outbound_travel_returns_to_camp_instead_of_advancing()
+    local puller, player, queue = pull_point_fixture()
+    puller:set_pull_point({ 20, 20, 0 })
+    player.position = { 15, 20, 0 }
+    puller.target = { get_mob = function() return { id = 1, index = 1, hpp = 100, status = 1 } end }
+    Condition.check_conditions = function(conditions) return conditions[1].kind == 'aggroed' end
+    assert(puller:move_to_pull_point(), 'aggro while leaving camp must take over the pull workflow')
+    assert(puller.returning_to_camp and puller:should_wait_for_first_hit(), 'aggro must enter return and first-hit phases')
+    assert(#queue.actions == 1 and queue.actions[1].identifier == 'Return to camp', 'aggro must queue a return, never more outbound movement')
+end
+
+function tests.pull_point_does_not_allow_engaging_a_fresh_target_from_camp()
+    local puller = pull_point_fixture()
+    puller:set_pull_point({ 20, 20, 0 })
+    puller.target = { get_mob = function() return { id = 1, index = 1 } end }
+    assert(puller:should_wait_to_engage(), 'fresh targets must wait for the pull-point trip and actual pull')
+    Condition.check_conditions = function(conditions) return conditions[1].kind == 'aggroed' end
+    assert(not puller:should_wait_to_engage(), 'a mob already brought back to camp may be engaged')
+end
+
+function tests.location_movement_revalidates_before_initial_and_repeated_run_commands()
+    local callback, completed
+    local moving = 0
+    local valid = true
+    local dependencies = {
+        ['cylibs/actions/action'] = {
+            new = function() return {} end,
+            is_cancelled = function() return false end,
+            complete = function(_, success) completed = success end,
+        },
+        ['cylibs/events/dispose_bag'] = { new = function() return { add = function() end } end },
+        ['cylibs/ui/views/render'] = { shared = function() return {
+            onPrerender = function() return { addAction = function(_, action) callback = action end } end,
+        } end },
+        ['cylibs/util/player_util'] = {
+            get_player_position = function() return { 0, 0, 0 } end,
+            distance = function() return 10 end,
+        },
+    }
+    local environment = setmetatable({
+        require = function(name) return dependencies[name] or {} end,
+        V = function(value) return value end,
+        windower = { ffxi = {
+            get_player = function() return { target_locked = false } end,
+            follow = function() end,
+            run = function(value) if value ~= false then moving = moving + 1 end end,
+        } },
+    }, { __index = _G })
+    local RunToLocation = assert(loadfile('cylibs/actions/runtolocation.lua', 't', environment))()
+    local action = RunToLocation.new(10, 0, 0, 1)
+    action.revalidate_while_running = true
+    action.validate = function() return valid end
+    action:perform()
+    assert(moving == 1, 'a valid fixed route must begin moving')
+    valid = false
+    callback()
+    assert(moving == 1 and completed == false, 'invalidated outbound movement must stop before any further run command')
+    action:perform()
+    assert(moving == 1, 'invalid outbound movement must not restart even before prerender')
+end
+
 function tests.camp_pull_waits_for_a_landed_melee_hit_on_the_pulled_mob()
     local puller, player, queue, ended = fixture()
     local mob = { id = 1, index = 1, hpp = 100, status = 1 }

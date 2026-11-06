@@ -61,7 +61,7 @@ function RunToLocationAction:can_perform()
 end
 
 function RunToLocationAction:perform()
-	if self:is_cancelled() then
+	if self:is_cancelled() or self.revalidate_while_running and not self:validate() then
 		windower.ffxi.run(false)
 		self:complete(false)
 		return
@@ -77,7 +77,7 @@ function RunToLocationAction:perform()
 
 	local prerender = Renderer.shared():onPrerender()
 	self.dispose_bag:add(prerender:addAction(function()
-		if self:is_cancelled() then
+		if self:is_cancelled() or self.revalidate_while_running and not self:validate() then
 			windower.ffxi.run(false)
 			self:complete(false)
 			return

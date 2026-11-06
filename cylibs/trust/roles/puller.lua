@@ -149,15 +149,124 @@ function Puller:tic(_, _)
 
     logger.notice(self.__class, 'tic', 'target_index', self.target_index or 'none')
 
+    self.mob_filter:set_center_position(self:get_pull_origin())
     self:return_to_camp(self.returning_to_camp and (state.AutoCampMode.value == 'Auto' or self:is_pull_to_camp_enabled()))
     self:check_target()
 end
 
 function Puller:check_gambits(gambits, param, ignore_delay)
-    if self:approach_pull_target() then
+    if self:move_to_pull_point() or self:approach_pull_target() then
         return
     end
     Gambiter.check_gambits(self, gambits, param, ignore_delay)
+end
+
+function Puller:get_outbound_aggro_target()
+    local target = self:get_pull_target()
+    local mob = target and target:get_mob()
+    if mob and Condition.check_conditions(L{ AggroedCondition.new() }, mob.index) then
+        return mob
+    end
+    if not self.outbound_mob_filter then
+        self.outbound_mob_filter = MobFilter.new(self:get_alliance(), 25)
+    end
+    return self.outbound_mob_filter:get_aggroed_mobs()[1]
+end
+
+function Puller:get_auto_pull_range()
+    local range = 0
+    for gambit in self.pull_abilities.Auto:it() do
+        if gambit:isEnabled() then
+            range = math.max(range, gambit:getAbility():get_range())
+        end
+    end
+    return range
+end
+
+function Puller:is_in_pull_range(mob)
+    local range = self:get_auto_pull_range() - 1
+    return mob and mob.distance ~= nil and range > 0 and mob.distance <= range^2
+            and self:is_valid_target(mob)
+            and Condition.check_conditions(L{ UnclaimedCondition.new() }, mob.index)
+end
+
+function Puller:get_in_range_pull_target()
+    if not self:is_enabled() or self.action_queue.is_singing or self.returning_to_camp
+            or not self:check_delay() or self:get_auto_pull_range() <= 1 then
+        return nil
+    end
+    local target = self:get_pull_target()
+    local mob = target and target:get_mob()
+    if self:is_in_pull_range(mob) then
+        return mob
+    end
+    for candidate in self:get_all_targets():it() do
+        if self:is_in_pull_range(candidate) then
+            return candidate
+        end
+    end
+    return nil
+end
+
+function Puller:can_move_to_pull_point(point, camp)
+    if not self:is_enabled() or not self:is_pull_to_camp_enabled() or self:get_pull_point() ~= point
+            or self:get_camp_position() ~= camp or self.action_queue.is_singing or self.returning_to_camp
+            or self:get_party():get_player():get_status() ~= 'Idle' or self:should_wait_for_first_hit()
+            or not self:check_delay() or self.action_queue:has_action(self:get_action_identifier()) then
+        return false
+    end
+    if math.sqrt((point[1] - camp[1])^2 + (point[2] - camp[2])^2) > 35 then
+        return false
+    end
+    return self:get_outbound_aggro_target() == nil and self:get_in_range_pull_target() == nil
+end
+
+function Puller:move_to_pull_point()
+    local point = self:get_pull_point()
+    if not point or not self:is_pull_to_camp_enabled() then
+        return false
+    end
+    local camp = self:get_camp_position()
+    local target = self:get_pull_target()
+    local selected_mob = target and target:get_mob()
+    local mob = self:get_outbound_aggro_target()
+    if self:is_enabled() and not self.action_queue.is_singing and not self.returning_to_camp
+            and self:get_party():get_player():get_status() == 'Idle'
+            and mob and (self:get_party():get_player():distance(camp[1], camp[2]) > 2
+            or not selected_mob or selected_mob.id ~= mob.id) then
+        self.first_hit_target_id = mob.id
+        self.returning_to_camp = true
+        if not selected_mob or selected_mob.id ~= mob.id then
+            self:set_pull_target(Monster.new(mob.id))
+        end
+        self:return_to_camp(true)
+        return true
+    end
+    local in_range_target = self:get_in_range_pull_target()
+    if in_range_target then
+        if not selected_mob or selected_mob.id ~= in_range_target.id then
+            self:set_pull_target(Monster.new(in_range_target.id))
+        end
+        return false
+    end
+    if not self:can_move_to_pull_point(point, camp) then
+        return false
+    end
+    if self.action_queue:has_action('Move to pull point') then
+        return true
+    end
+    if self:get_party():get_player():distance(point[1], point[2]) <= 1 then
+        return false
+    end
+    local action = RunToLocationAction.new(point[1], point[2], point[3], 1)
+    action.identifier = 'Move to pull point'
+    action.priority = self:get_priority()
+    action.revalidate_while_running = true
+    action.validate = function()
+        return self:can_move_to_pull_point(point, camp)
+    end
+    self.action_queue:push_action(action, true)
+    return true
 end
 
 function Puller:approach_pull_target()
@@ -175,12 +284,7 @@ function Puller:approach_pull_target()
     if not self:is_valid_target(mob) or not Condition.check_conditions(L{ UnclaimedCondition.new() }, mob.index) then
         return false
     end
-    local range = 0
-    for gambit in self.pull_abilities.Auto:it() do
-        if gambit:isEnabled() then
-            range = math.max(range, gambit:getAbility():get_range())
-        end
-    end
+    local range = self:get_auto_pull_range()
     if range < 15.5 or math.sqrt(mob.distance) <= range then
         return false
     end
@@ -206,6 +310,15 @@ function Puller:is_gambit_satisfied(gambit, param, resolved_targets)
     if self:is_pull_to_camp_enabled() and self.returning_to_camp then
         return false, nil
     end
+    local point = self:get_pull_point()
+    if self:is_pull_to_camp_enabled() and point then
+        local target = self:get_pull_target()
+        local mob = target and target:get_mob()
+        if self.action_queue.is_singing or not self:check_delay()
+                or self:get_party():get_player():distance(point[1], point[2]) > 1 and not self:is_in_pull_range(mob) then
+            return false, nil
+        end
+    end
     return Gambiter.is_gambit_satisfied(self, gambit, param, resolved_targets)
 end
 
@@ -222,7 +335,8 @@ function Puller:check_target(target_id_blacklist)
 
     local next_target = self:get_pull_target()
 
-    if not self:is_valid_target(next_target and next_target:get_mob(), target_id_blacklist) then
+        if not self:is_valid_target(next_target and next_target:get_mob(), target_id_blacklist)
+            or not self:is_reachable_from_pull_point(next_target and next_target:get_mob()) then
         if next_target and next_target:get_mob() then
             local previous_target = next_target:get_mob()
             logger.notice(self.__class, 'check_target', 'clear', previous_target.name, previous_target.hpp, previous_target.index, previous_target.status, previous_target.claim_id or 'unclaimed')
@@ -310,6 +424,7 @@ function Puller:get_next_target(target_id_blacklist)
     end
     local all_targets = self:get_all_targets():filter(function(target)
         return not target_id_blacklist:contains(target.id) and self:is_valid_target(target)
+            and self:is_reachable_from_pull_point(target)
     end)
     if all_targets:length() > 0 then
         return Monster.new(all_targets[1].id)
@@ -327,7 +442,7 @@ function Puller:is_valid_target(target, target_id_blacklist)
         MinHitPointsPercentCondition.new(1),
         ConditionalCondition.new(L{
             PartyClaimedCondition.new(true),
-            ConditionalCondition.new(L{ UnclaimedCondition.new(), MaxDistanceCondition.new(self.distance or 25, nil, self:get_camp_position()) }, Condition.LogicalOperator.And),
+            ConditionalCondition.new(L{ UnclaimedCondition.new(), MaxDistanceCondition.new(self.distance or 25, nil, self:get_pull_origin()) }, Condition.LogicalOperator.And),
         }, Condition.LogicalOperator.Or),
         NotCondition.new(L{ TargetNamesCondition.new(self.blacklist) }),
     }
@@ -356,7 +471,7 @@ function Puller:set_pull_settings(pull_settings)
     self.blacklist = pull_settings.Blacklist
     self.delay = pull_settings.Delay or 0
     self.mob_filter = MobFilter.new(self:get_alliance(), self.distance or 25, nil, self.blacklist)
-    self.mob_filter:set_center_position(self.camp_position)
+    self.mob_filter:set_center_position(self:get_pull_origin())
     if pull_settings.RandomizeTarget then
         self.max_num_targets = 6
     else
@@ -460,7 +575,42 @@ function Puller:set_camp_position(position)
     self.camp_position = position
     self.returning_to_camp = false
     self.first_hit_target_id = nil
-    self.mob_filter:set_center_position(position)
+    self.mob_filter:set_center_position(self:get_pull_origin())
+end
+
+function Puller:set_pull_point(position)
+    self.pull_point = position
+    self.mob_filter:set_center_position(self:get_pull_origin())
+end
+
+function Puller:get_pull_point()
+    return self.pull_point
+end
+
+function Puller:get_pull_origin()
+    if self:is_pull_to_camp_enabled() and self:get_pull_point() then
+        return nil
+    end
+    return self:get_camp_position()
+end
+
+function Puller:is_reachable_from_pull_point(mob)
+    local point = self:get_pull_point()
+    if not self:is_pull_to_camp_enabled() or not point then
+        return true
+    end
+    if not mob then
+        return false
+    end
+    if Condition.check_conditions(L{ AggroedCondition.new() }, mob.index) then
+        return true
+    end
+    if self:is_in_pull_range(mob) then
+        return true
+    end
+    local range = self:get_auto_pull_range() - 1
+    return mob.x ~= nil and mob.y ~= nil and range > 0
+            and (mob.x - point[1])^2 + (mob.y - point[2])^2 <= range^2
 end
 
 function Puller:get_camp_position()
@@ -477,6 +627,13 @@ function Puller:should_wait_to_engage()
         return false
     end
     local camp_position = self:get_camp_position()
+    if self:get_pull_point() then
+        local target = self:get_pull_target()
+        local mob = target and target:get_mob()
+        if mob and not Condition.check_conditions(L{ AggroedCondition.new() }, mob.index) then
+            return true
+        end
+    end
     return self.action_queue:has_action(self:get_action_identifier())
             or self:get_party():get_player():distance(camp_position[1], camp_position[2]) > 2
 end

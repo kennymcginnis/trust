@@ -24,6 +24,9 @@ function PullTrustCommands.new(trust, trust_settings, action_queue, puller)
     self:add_command('camp', self.handle_camp, 'Set camp and return after battle, or after pulling with camp pull', L{
         PickerConfigItem.new('mode', 'auto', L{ 'auto', 'pull' }, nil, "Camp Mode")
     })
+    self:add_command('point', self.handle_point, 'Save the pull travel limit, or clear it for stationary camp pulling', L{
+        PickerConfigItem.new('operation', 'save', L{ 'save', 'clear' }, nil, "Pull Point")
+    })
     self:add_command('ignore', self.handle_ignore, 'Add a mob to the blacklist')
     self:add_command('delay', self.handle_delay, 'Set delay between pulls')
 
@@ -82,6 +85,30 @@ function PullTrustCommands:handle_camp(_, mode)
         or "Return to the current position after battle"
 
     return success, message
+end
+
+function PullTrustCommands:handle_point(_, operation)
+    operation = operation and operation:lower() or 'save'
+    local puller = self:get_puller()
+    if operation == 'clear' then
+        puller:set_pull_point(nil)
+        return true, 'Pull point cleared; pull from camp without advancing'
+    elseif operation ~= 'save' then
+        return false, 'Usage: // trust pull point [clear]'
+    end
+    local camp = puller:get_camp_position()
+    if not camp or state.AutoCampMode.value ~= 'Pull' then
+        return false, 'Set camp first with // trust pull camp pull'
+    end
+    local position = ffxi_util.get_mob_position(windower.ffxi.get_player().name)
+    if not position then
+        return false, 'Unable to determine the current position'
+    end
+    if math.sqrt((position[1] - camp[1])^2 + (position[2] - camp[2])^2) > 35 then
+        return false, 'Pull point must be within 35 yalms of camp'
+    end
+    puller:set_pull_point(V{ position[1], position[2], position[3] })
+    return true, 'Pull limit saved; stop sooner for an in-range mob, then return to camp'
 end
 
 -- // trust pull ignore
