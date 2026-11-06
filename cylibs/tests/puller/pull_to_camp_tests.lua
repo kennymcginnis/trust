@@ -446,6 +446,7 @@ end
 function tests.combat_start_positions_before_hit_but_not_during_songs()
     local faces = 0
     local camp_distance = 0
+    local engaged = true
     local environment = setmetatable({ require = function(name)
         if name == 'cylibs/util/player_util' then
             return { face = function() faces = faces + 1 end }
@@ -469,7 +470,7 @@ function tests.combat_start_positions_before_hit_but_not_during_songs()
         addon_enabled = { getValue = function() return true end },
         get_target = function() return { get_mob = function() return mob end } end,
         get_player = function() return {
-            get_status = function() return 'Engaged' end,
+            is_engaged = function() return engaged end,
             distance = function() return camp_distance end,
         } end,
         get_action_identifier = function() return 'combatmode_action' end,
@@ -480,6 +481,12 @@ function tests.combat_start_positions_before_hit_but_not_during_songs()
     assert(#queue.actions == 1 and queue.actions[1].distance == 2, 'camp combat start must enforce melee spacing even if normal CombatMode is Off')
     local movement = queue.actions[1]
     assert(movement.maintain_distance and movement.revalidate_while_running, 'combat movement must retreat and continuously check safety')
+    assert(movement:validate(), 'positioning must validate through the actual combat-player API')
+    engaged = false
+    assert(not movement:validate(), 'disengaging must invalidate active positioning')
+    combat:check_gambits()
+    assert(#queue.actions == 1, 'disengaged players must not start melee positioning')
+    engaged = true
     local faces_before_singing = faces
     queue.is_singing = true
     assert(not movement:validate(), 'queued or running movement must become invalid while singing')

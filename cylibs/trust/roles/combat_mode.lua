@@ -86,7 +86,7 @@ function CombatMode:check_gambits(gambits, param, ignore_delay)
         local target = self:get_target()
         local mob = target and target:get_mob()
         local current_target = windower.ffxi.get_mob_by_target('t')
-        if self:is_in_camp_combat_area() and self:get_player():get_status() == 'Engaged' and mob and current_target
+        if self:is_in_camp_combat_area() and self:get_player():is_engaged() and mob and current_target
                 and mob.id == current_target.id and math.sqrt(mob.distance) <= 5 then
             self:face_target(mob)
             local distance = math.min(3, math.max(1.5, self.distance))
@@ -134,7 +134,7 @@ function CombatMode:queue_positioning(target, distance, gambit, param)
         local selected_target = windower.ffxi.get_mob_by_target('t')
         return self.action_queue.puller and self.action_queue.puller:should_wait_for_first_hit()
             and self:is_in_camp_combat_area()
-                and self:get_player():get_status() == 'Engaged' and selected_target
+                and self:get_player():is_engaged() and selected_target
                 and selected_target.id == mob.id and math.sqrt(current_target.distance) <= 5
     end
     self.last_gambit_time = os.clock()
