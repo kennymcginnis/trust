@@ -149,8 +149,9 @@ function ActionQueue:perform_next_action()
 		return
 	end
 
-	local next_action = self.queue:pop()
-	if next_action ~= nil and next_action:can_perform() and next_action:validate() then
+    local next_action = self.queue:pop()
+	if next_action ~= nil and (not self.action_start_filter or self.action_start_filter(next_action))
+			and next_action:can_perform() and next_action:validate() then
 		local forced_delay = self:get_forced_delay(next_action)
 		if forced_delay > 0 then
 			local display_name = next_action.display_name

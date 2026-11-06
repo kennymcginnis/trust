@@ -62,18 +62,27 @@ function RunToAction:perform()
 
 		local angle = (math.atan2((target.y - player.y), (target.x - player.x))*180/math.pi)*-1
 
-		windower.ffxi.follow()
-		
-		windower.ffxi.run((angle):radian())
-
-		local adjusted_distance = self.distance --+ player.model_size + target.model_size - 0.2
-		if target.distance:sqrt() < adjusted_distance then
+		local distance = math.sqrt(target.distance)
+		local arrived = distance <= self.distance
+		if self.maintain_distance then
+			arrived = math.abs(distance - self.distance) <= 0.5
+		end
+		if arrived then
 			windower.ffxi.run(false)
+			if self.maintain_distance then
+				windower.ffxi.turn(math.rad(angle))
+			end
 			if self.was_locked_on then
 				windower.send_command('input /lockon')
 			end
 			self:complete(true)
+			return
 		end
+		if self.maintain_distance and distance < self.distance then
+			angle = angle + 180
+		end
+		windower.ffxi.follow()
+		windower.ffxi.run(math.rad(angle))
 	end), Renderer.shared():onPrerender())
 end
 

@@ -3,6 +3,7 @@ local DisposeBag = require('cylibs/events/dispose_bag')
 local DistanceCondition = require('cylibs/conditions/distance')
 local GambitTarget = require('cylibs/gambits/gambit_target')
 local IsAssistTargetCondition = require('cylibs/conditions/is_assist_target')
+local RunToAction = require('cylibs/actions/runto')
 local player_util = require('cylibs/util/player_util')
 local flanking_util = require("cylibs/util/flanking_util")
 
@@ -63,15 +64,86 @@ function CombatMode:on_add()
 end
 
 function CombatMode:face_target(target)
-    if not self.addon_enabled:getValue() then
+    if not self.addon_enabled:getValue() or self.action_queue.is_singing or not target then
         return
     end
     -- NOTE: this specifically does not go into the action queue because it occurs too
     -- frequently and would delay other actions.
-    if state.AutoFaceMobMode.value == 'Auto' then
+        if state.AutoFaceMobMode.value == 'Auto'
+            or self.action_queue.puller and self.action_queue.puller:should_wait_for_first_hit() then
         player_util.face(target)
     elseif state.AutoFaceMobMode.value == 'Away' then
         player_util.face_away(target)
+    end
+end
+
+function CombatMode:check_gambits(gambits, param, ignore_delay)
+    if not self:is_enabled() or not self.addon_enabled:getValue() or self.action_queue.is_singing then
+        return
+    end
+    local puller = self.action_queue.puller
+    if puller and puller:should_wait_for_first_hit() then
+        local target = self:get_target()
+        local mob = target and target:get_mob()
+        local current_target = windower.ffxi.get_mob_by_target('t')
+        if self:is_in_camp_combat_area() and self:get_player():get_status() == 'Engaged' and mob and current_target
+                and mob.id == current_target.id and math.sqrt(mob.distance) <= 5 then
+            self:face_target(mob)
+            local distance = math.min(3, math.max(1.5, self.distance))
+            if math.abs(math.sqrt(mob.distance) - distance) > 0.5 then
+                self:queue_positioning(target, distance)
+            end
+        end
+        return
+    end
+    Gambiter.check_gambits(self, gambits, param, ignore_delay)
+end
+
+function CombatMode:is_in_camp_combat_area()
+    local puller = self.action_queue.puller
+    local camp = puller and puller:get_camp_position()
+    return camp and self:get_player():distance(camp[1], camp[2]) <= 5
+end
+
+function CombatMode:is_gambit_satisfied(gambit, param, resolved_targets)
+    if not self:is_enabled() or self.action_queue.is_singing or not self.addon_enabled:getValue() then
+        return false, nil
+    end
+    return Gambiter.is_gambit_satisfied(self, gambit, param, resolved_targets)
+end
+
+function CombatMode:queue_positioning(target, distance, gambit, param)
+    if self.action_queue:has_action(self:get_action_identifier()) then
+        return
+    end
+    local mob = target:get_mob()
+    local action = RunToAction.new(mob.index, distance)
+    action.identifier = self:get_action_identifier()
+    action.priority = self:get_priority()
+    action.maintain_distance = true
+    action.revalidate_while_running = true
+    action.validate = function()
+        local current_target = target:get_mob()
+        if not self:is_enabled() or self.action_queue.is_singing or not self.addon_enabled:getValue() or not current_target
+                or current_target.hpp == 0 or current_target.status == 2 or current_target.status == 3 then
+            return false
+        end
+        if gambit then
+            return self:is_gambit_satisfied(gambit, param)
+        end
+        local selected_target = windower.ffxi.get_mob_by_target('t')
+        return self.action_queue.puller and self.action_queue.puller:should_wait_for_first_hit()
+            and self:is_in_camp_combat_area()
+                and self:get_player():get_status() == 'Engaged' and selected_target
+                and selected_target.id == mob.id and math.sqrt(current_target.distance) <= 5
+    end
+    self.last_gambit_time = os.clock()
+    self.action_queue:push_action(action, true)
+end
+
+function CombatMode:perform_gambit(gambit, target, param)
+    if target and target:get_mob() then
+        self:queue_positioning(target, gambit:getAbility():get_distance(), gambit, param)
     end
 end
 
@@ -98,12 +170,11 @@ function CombatMode:set_combat_settings(combat_settings)
         }
     }
 
-    local distance_condition
-    if self.distance < 4 then
-        distance_condition = GambitCondition.new(DistanceCondition.new(self.distance, Condition.Operator.GreaterThan), GambitTarget.TargetType.Enemy)
-    else
-        distance_condition = GambitCondition.new(ConditionalCondition.new(L{ DistanceCondition.new(self.distance + 1, Condition.Operator.GreaterThan), DistanceCondition.new(self.distance - 1, Condition.Operator.LessThan) }, Condition.LogicalOperator.Or), GambitTarget.TargetType.Enemy)
-    end
+    local tolerance = self.distance < 4 and 0.5 or 1
+    local distance_condition = GambitCondition.new(ConditionalCondition.new(L{
+        DistanceCondition.new(self.distance + tolerance, Condition.Operator.GreaterThan),
+        DistanceCondition.new(self.distance - tolerance, Condition.Operator.LessThan),
+    }, Condition.LogicalOperator.Or), GambitTarget.TargetType.Enemy)
     gambit_settings.Gambits:append(
         Gambit.new(GambitTarget.TargetType.Enemy, L{
             GambitCondition.new(ModeCondition.new('CombatMode', 'Auto'), GambitTarget.TargetType.Self),

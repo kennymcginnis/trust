@@ -16,6 +16,7 @@ local RunToAction = require('cylibs/actions/runto')
 local RunToLocationAction = require('cylibs/actions/runtolocation')
 local TargetIdsCondition = require('cylibs/conditions/target_ids')
 local TargetNamesCondition = require('cylibs/conditions/target_names')
+local action_message_util = require('cylibs/util/action_message_util')
 
 local Gambiter = require('cylibs/trust/roles/gambiter')
 local Puller = setmetatable({}, {__index = Gambiter })
@@ -49,6 +50,12 @@ function Puller.new(action_queue, pull_settings, job)
 end
 
 function Puller:destroy()
+    if self.action_queue.puller == self then
+        self.action_queue.puller = nil
+    end
+    if self.action_queue.action_start_filter == self.action_start_filter then
+        self.action_queue.action_start_filter = nil
+    end
     Gambiter.destroy(self)
 
     self.dispose_bag:destroy()
@@ -56,6 +63,29 @@ end
 
 function Puller:on_add()
     Gambiter.on_add(self)
+
+    self.action_start_filter = function(action)
+        return self:can_start_action(action)
+    end
+    self.action_queue.action_start_filter = self.action_start_filter
+    self.action_queue.puller = self
+
+    self.dispose_bag:add(WindowerEvents.Action:addAction(function(action)
+        if action.actor_id ~= windower.ffxi.get_player().id or action.category ~= 1
+                or not self:should_wait_for_first_hit() then
+            return
+        end
+        for _, target in ipairs(action.targets or {}) do
+            if target.id == self.first_hit_target_id then
+                for _, hit in ipairs(target.actions or {}) do
+                    if action_message_util.is_hit_attack_message(hit.message) then
+                        self.first_hit_target_id = nil
+                        return
+                    end
+                end
+            end
+        end
+    end), WindowerEvents.Action)
 
     local current_target = self:get_alliance():get_target_by_index(self:get_party():get_player():get_target_index())
     if state.AutoPullMode.value ~= 'Off' and current_target and self:is_valid_target(current_target:get_mob()) then
@@ -76,6 +106,7 @@ function Puller:on_add()
 
     self.dispose_bag:add(state.AutoPullMode:on_state_change():addAction(function(_, new_value)
         self.returning_to_camp = false
+        self.first_hit_target_id = nil
         on_pull_mode_changed(new_value)
     end), state.AutoPullMode:on_state_change())
 
@@ -84,6 +115,9 @@ function Puller:on_add()
             self.returning_to_camp = false
         end
         if success and action:getidentifier() == self:get_action_identifier() and self:is_pull_to_camp_enabled() then
+            local target = self:get_pull_target()
+            local mob = target and target.get_mob and target:get_mob()
+            self.first_hit_target_id = mob and mob.id
             self.returning_to_camp = true
             self:return_to_camp(true)
         end
@@ -128,6 +162,7 @@ end
 
 function Puller:approach_pull_target()
     if not self:is_enabled() or state.PullActionMode.value ~= 'Auto' or state.AutoPullMode.value == 'Off'
+            or self:is_pull_to_camp_enabled() or self.action_queue.is_singing
             or self.returning_to_camp or self:get_party():get_player():get_status() ~= 'Idle'
             or not self:check_delay() or self.action_queue:has_action(self:get_action_identifier()) then
         return false
@@ -157,6 +192,7 @@ function Puller:approach_pull_target()
         local current_target = self:get_pull_target()
         local current_mob = current_target and current_target:get_mob()
         return state.AutoPullMode.value ~= 'Off' and state.PullActionMode.value == 'Auto'
+            and not self:is_pull_to_camp_enabled() and not self.action_queue.is_singing
                 and not self.returning_to_camp and self:get_party():get_player():get_status() == 'Idle'
                 and current_mob and current_mob.index == mob.index and self:is_valid_target(current_mob)
                 and Condition.check_conditions(L{ UnclaimedCondition.new() }, current_mob.index)
@@ -423,6 +459,7 @@ end
 function Puller:set_camp_position(position)
     self.camp_position = position
     self.returning_to_camp = false
+    self.first_hit_target_id = nil
     self.mob_filter:set_center_position(position)
 end
 
@@ -442,6 +479,26 @@ function Puller:should_wait_to_engage()
     local camp_position = self:get_camp_position()
     return self.action_queue:has_action(self:get_action_identifier())
             or self:get_party():get_player():distance(camp_position[1], camp_position[2]) > 2
+end
+
+function Puller:should_wait_for_first_hit()
+    local target = self:get_pull_target()
+    local mob = target and target:get_mob()
+    if not self:is_pull_to_camp_enabled() or not mob or mob.id ~= self.first_hit_target_id
+            or mob.hpp == 0 or mob.status == 2 or mob.status == 3 then
+        self.first_hit_target_id = nil
+        return false
+    end
+    return self.first_hit_target_id ~= nil
+end
+
+function Puller:can_start_action(action)
+    if not self:should_wait_for_first_hit() then
+        return true
+    end
+    local identifier = action:getidentifier()
+    return L{ 'Return to camp', 'attacker_action', 'combatmode_action', 'healer_action' }:contains(identifier)
+            or type(identifier) == 'string' and identifier:sub(1, 8) == 'sleeper_'
 end
 
 function Puller:get_cooldown()

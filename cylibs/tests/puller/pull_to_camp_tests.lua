@@ -66,6 +66,7 @@ end
 
 local Gambiter = {
     on_add = function() end,
+    check_gambits = function() end,
     is_enabled = function() return true end,
     get_priority = function() return 0 end,
     get_action_identifier = function() return 'puller_action' end,
@@ -74,6 +75,7 @@ local Gambiter = {
 local original_require = require
 local modules = {
     ['cylibs/trust/roles/gambiter'] = Gambiter,
+    ['cylibs/conditions/aggroed'] = { new = function() return { kind = 'aggroed' } end },
     ['cylibs/conditions/party_claimed'] = { new = function() return { kind = 'claimed' } end },
     ['cylibs/conditions/target_names'] = { new = function(names) return { kind = 'names', names = names } end },
     ['cylibs/conditions/conditional'] = { new = function(conditions, operator)
@@ -99,7 +101,8 @@ local modules = {
 }
 function require(name)
     if name == 'cylibs/trust/roles/puller' or name == 'cylibs/trust/roles/attacker'
-            or name == 'commands/PullCommands' or name == 'cylibs/trust/trust' then
+            or name == 'commands/PullCommands' or name == 'cylibs/trust/trust'
+            or name == 'cylibs/util/action_message_util' then
         return original_require(name)
     end
     return modules[name] or {}
@@ -118,8 +121,11 @@ local function fixture()
     local mode_changed = event()
     local status_changed = event()
     state.AutoPullMode.on_state_change = function() return mode_changed end
-    WindowerEvents = { MobKO = event() }
-    windower = { send_command = function() end, ffxi = { run = function() end } }
+    WindowerEvents = { MobKO = event(), Action = event() }
+    windower = { send_command = function() end, ffxi = {
+        run = function() end,
+        get_player = function() return { id = 100 } end,
+    } }
     local player = {
         current_distance = 15,
         get_status = function() return 'Idle' end,
@@ -157,6 +163,91 @@ local function fixture()
 end
 
 local tests = {}
+function tests.camp_pull_waits_for_a_landed_melee_hit_on_the_pulled_mob()
+    local puller, player, queue, ended = fixture()
+    local mob = { id = 1, index = 1, hpp = 100, status = 1 }
+    puller.target = { get_mob = function() return mob end }
+    ended:trigger({ getidentifier = function() return 'puller_action' end }, true)
+    player.current_distance = 1
+    player.get_status = function() return 'Engaged' end
+    ended:trigger({ getidentifier = function() return 'Return to camp' end }, true)
+    assert(puller:should_wait_for_first_hit(), 'drawing a weapon at camp must not release routine actions')
+    local function action(identifier) return { getidentifier = function() return identifier end } end
+    assert(not queue.action_start_filter(action('singer_action')), 'songs must wait for a landed melee hit')
+    assert(not queue.action_start_filter(action('debuffer_action')), 'routine actions must wait too')
+    for _, identifier in ipairs({ 'attacker_action', 'combatmode_action', 'healer_action', 'sleeper_Horde Lullaby II', 'Return to camp' }) do
+        assert(queue.action_start_filter(action(identifier)), identifier..' must remain available')
+    end
+    local function attack(actor, category, target, message)
+        WindowerEvents.Action:trigger({ actor_id = actor, category = category,
+            targets = { { id = target, actions = { { message = message, param = 12 } } } } })
+    end
+    attack(100, 2, 1, 1)
+    attack(200, 1, 1, 1)
+    attack(100, 1, 2, 1)
+    attack(100, 1, 1, 15)
+    assert(puller:should_wait_for_first_hit(), 'ranged pulls, ally attacks, other targets, and misses must not count')
+    attack(100, 1, 1, 264)
+    assert(not puller:should_wait_for_first_hit(), 'a landed player melee hit must release routine actions')
+    assert(queue.action_start_filter(action('singer_action')), 'songs must resume after the hit')
+end
+
+function tests.actual_queue_skips_waiting_songs_but_starts_engagement()
+    local puller, _, _, ended = fixture()
+    puller.target = { get_mob = function() return { id = 1, hpp = 100, status = 1 } end }
+    ended:trigger({ getidentifier = function() return 'puller_action' end }, true)
+    local dependencies = {
+        ['cylibs/events/Luvent'] = { newEvent = event },
+        ['cylibs/actions/job_ability'] = { __type = 'JobAbilityAction' },
+        ['cylibs/actions/spell'] = { __type = 'SpellAction' },
+        ['cylibs/actions/weapon_skill'] = { __type = 'WeaponSkillAction' },
+        ['cylibs/actions/sequence'] = { __type = 'SequenceAction' },
+    }
+    local environment = setmetatable({ require = function(name) return dependencies[name] or {} end }, { __index = _G })
+    local ActionQueue = assert(loadfile('cylibs/actions/action_queue.lua', 't', environment))()
+    local song_destroyed, engaged = false, false
+    local pending = {
+        {
+            getidentifier = function() return 'singer_action' end,
+            can_perform = function() return true end,
+            validate = function() return true end,
+            perform = function() error('songs must not start before first hit') end,
+            destroy = function() song_destroyed = true end,
+        },
+        {
+            getidentifier = function() return 'attacker_action' end,
+            can_perform = function() return true end,
+            validate = function() return true end,
+            perform = function() engaged = true end,
+            set_action_queue_id = function() end,
+            on_action_complete = event,
+            set_start_time = function() end,
+        },
+    }
+    local queue = setmetatable({
+        queue = { empty = function() return #pending == 0 end, pop = function() return table.remove(pending, 1) end },
+        action_start_filter = puller.action_start_filter,
+        action_start = event(),
+        forced_delay_time = os.clock() - 1,
+    }, ActionQueue)
+    queue:perform_next_action()
+    assert(song_destroyed and engaged, 'real queue must skip routine songs and continue to the engagement action')
+end
+
+function tests.first_hit_wait_is_cleared_by_target_loss_or_disabled_pulling()
+    local puller, _, queue, ended = fixture()
+    puller.target = { get_mob = function() return { id = 1, hpp = 100, status = 1 } end }
+    ended:trigger({ getidentifier = function() return 'puller_action' end }, true)
+    assert(puller:should_wait_for_first_hit())
+    puller.target = nil
+    assert(not puller:should_wait_for_first_hit(), 'target loss must release the pause')
+    puller.target = { get_mob = function() return { id = 2, hpp = 100, status = 1 } end }
+    assert(not puller:should_wait_for_first_hit(), 'a replacement target must not inherit the pause')
+    ended:trigger({ getidentifier = function() return 'puller_action' end }, true)
+    state.AutoPullMode.value = 'Off'
+    assert(queue.action_start_filter({ getidentifier = function() return 'singer_action' end }), 'turning pulling off must release songs')
+end
+
 function tests.targets_follow_name_priority_then_distance_without_random_selection()
     local puller = fixture()
     puller.check_delay = function() return true end
@@ -199,6 +290,7 @@ end
 
 local function distant_pull_fixture(distance)
     local puller, player, queue, ended = fixture()
+    state.AutoCampMode.value = 'Off'
     local mob = { id = 1, index = 1, distance = distance * distance }
     puller.target = { get_mob = function() return mob end }
     puller.check_delay = function() return true end
@@ -211,6 +303,26 @@ local function distant_pull_fixture(distance)
     UnclaimedCondition = { new = function() return {} end }
     Condition = { check_conditions = function() return true end }
     return puller, player, queue, ended, mob
+end
+
+function tests.camp_pull_never_approaches_a_distant_fresh_mob()
+    local puller, _, queue = distant_pull_fixture(40)
+    state.AutoCampMode.value = 'Pull'
+    assert(not puller:approach_pull_target(), 'camp pulling must not run toward packs to reach a distant mob')
+    assert(#queue.actions == 0, 'no automatic approach action may be queued in camp pull mode')
+end
+
+function tests.active_approach_is_invalidated_by_camp_pull_or_singing()
+    local puller, _, queue = distant_pull_fixture(40)
+    Condition.check_conditions = function(conditions) return conditions[1].kind ~= 'aggroed' end
+    assert(puller:approach_pull_target())
+    local movement = queue.actions[1]
+    assert(movement:validate(), 'ordinary non-camp approach must initially be valid')
+    state.AutoCampMode.value = 'Pull'
+    assert(not movement:validate(), 'switching to camp pull must stop an existing approach')
+    state.AutoCampMode.value = 'Off'
+    queue.is_singing = true
+    assert(not movement:validate(), 'beginning songs must invalidate an existing approach')
 end
 
 function tests.distant_auto_pull_moves_into_attack_range_without_engaging_or_returning()
@@ -284,6 +396,118 @@ function tests.running_approach_revalidates_before_sending_movement()
     action:perform()
     callback()
     assert(stopped and completed == false, 'invalidated active approach must stop before moving toward the mob')
+end
+
+function tests.combat_movement_backs_out_of_overlap_and_stops_before_swinging()
+    debug.setmetatable(0, { __index = {
+        radian = function(value) return math.rad(value) end,
+        sqrt = function(value) return math.sqrt(value) end,
+    } })
+    local callback, completed
+    local runs, turns = {}, {}
+    local mob = { x = 0, y = 0, distance = 0 }
+    local dependencies = {
+        ['cylibs/actions/action'] = {
+            new = function() return {} end,
+            is_cancelled = function() return false end,
+            complete = function(_, success) completed = success end,
+        },
+        ['cylibs/events/dispose_bag'] = { new = function() return { add = function() end } end },
+        ['cylibs/ui/views/render'] = { shared = function() return {
+            onPrerender = function() return { addAction = function(_, action) callback = action end } end,
+        } end },
+    }
+    local environment = setmetatable({
+        require = function(name) return dependencies[name] end,
+        math = setmetatable({ atan2 = function(vertical, horizontal) return math.atan(vertical, horizontal) end }, { __index = math }),
+        windower = { ffxi = {
+            get_player = function() return { id = 100, target_locked = false } end,
+            get_mob_by_index = function() return mob end,
+            get_mob_by_id = function() return { x = 0, y = 0 } end,
+            run = function(value) table.insert(runs, value) end,
+            turn = function(value) table.insert(turns, value) end,
+            follow = function() end,
+        } },
+    }, { __index = _G })
+    local RunTo = assert(loadfile('cylibs/actions/runto.lua', 't', environment))()
+    local action = RunTo.new(1, 2)
+    action.maintain_distance = true
+    action.revalidate_while_running = true
+    action.validate = function() return true end
+    action:perform()
+    callback()
+    assert(#runs == 1 and math.abs(runs[1] - math.pi) < 0.01, 'overlapping mobs must cause a retreat, not movement toward the mob')
+    mob.x, mob.distance = 2, 4
+    callback()
+    assert(#runs == 2 and runs[2] == false and completed == true, 'arrival must stop without sending another movement command')
+    assert(#turns == 1, 'arrival must face the mob so a melee swing can happen')
+end
+
+function tests.combat_start_positions_before_hit_but_not_during_songs()
+    local faces = 0
+    local camp_distance = 0
+    local environment = setmetatable({ require = function(name)
+        if name == 'cylibs/util/player_util' then
+            return { face = function() faces = faces + 1 end }
+        end
+        return modules[name] or {}
+    end }, { __index = _G })
+    local CombatMode = assert(loadfile('cylibs/trust/roles/combat_mode.lua', 't', environment))()
+    local mob = { id = 1, index = 1, distance = 0, hpp = 100, status = 1 }
+    local queue = {
+        actions = {},
+        puller = {
+            should_wait_for_first_hit = function() return true end,
+            get_camp_position = function() return { 0, 0, 0 } end,
+        },
+        has_action = function() return false end,
+        push_action = function(self, action) table.insert(self.actions, action) end,
+    }
+    local combat = setmetatable({
+        action_queue = queue,
+        distance = 2,
+        addon_enabled = { getValue = function() return true end },
+        get_target = function() return { get_mob = function() return mob end } end,
+        get_player = function() return {
+            get_status = function() return 'Engaged' end,
+            distance = function() return camp_distance end,
+        } end,
+        get_action_identifier = function() return 'combatmode_action' end,
+    }, CombatMode)
+    windower.ffxi.get_mob_by_target = function() return mob end
+    state.CombatMode.value = 'Off'
+    combat:check_gambits()
+    assert(#queue.actions == 1 and queue.actions[1].distance == 2, 'camp combat start must enforce melee spacing even if normal CombatMode is Off')
+    local movement = queue.actions[1]
+    assert(movement.maintain_distance and movement.revalidate_while_running, 'combat movement must retreat and continuously check safety')
+    local faces_before_singing = faces
+    queue.is_singing = true
+    assert(not movement:validate(), 'queued or running movement must become invalid while singing')
+    combat:check_gambits()
+    combat:face_target(mob)
+    assert(#queue.actions == 1 and faces == faces_before_singing, 'song sequences must suppress both movement and turning')
+    assert(not combat:is_gambit_satisfied({}), 'normal combat movement must also wait for songs')
+    queue.is_singing = false
+    mob.distance = 100
+    assert(not movement:validate(), 'combat startup must stop instead of chasing a departing mob')
+    combat:check_gambits()
+    assert(#queue.actions == 1, 'combat startup must wait for a distant mob to come to camp')
+    mob.distance = 4
+    camp_distance = 6
+    assert(not movement:validate(), 'melee startup must not chase a mob outside the camp area')
+end
+
+function tests.singing_stops_autorun_and_marks_the_entire_sequence_active()
+    local Singer = assert(loadfile('cylibs/trust/roles/singer.lua'))()
+    local stopped = 0
+    windower.ffxi.run = function(value) if value == false then stopped = stopped + 1 end end
+    local singer = setmetatable({ action_queue = {}, songs_begin = event(), songs_end = event() }, Singer)
+    singer:set_is_singing(true)
+    assert(singer.action_queue.is_singing and stopped == 1, 'beginning songs must stop autorun and block movement')
+    singer:set_is_singing(true)
+    assert(stopped == 1, 'the active song sequence must not be repeatedly restarted')
+    singer:set_is_singing(false)
+    assert(not singer.action_queue.is_singing, 'movement may resume only when the sequence ends')
 end
 
 function tests.detection_range_is_independent_of_pull_ability_range()

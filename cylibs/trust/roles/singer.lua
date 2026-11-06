@@ -250,11 +250,19 @@ function Singer:set_is_singing(is_singing)
         return
     end
     self.is_singing = is_singing
+    self.action_queue.is_singing = is_singing
     if self.is_singing then
+        windower.ffxi.run(false)
         self:on_songs_begin():trigger(self)
     else
         self:on_songs_end():trigger(self)
     end
+end
+
+function Singer:destroy()
+    self:set_is_singing(false)
+    Gambiter.destroy(self)
+    self.dispose_bag:destroy()
 end
 
 function Singer:get_is_singing()
