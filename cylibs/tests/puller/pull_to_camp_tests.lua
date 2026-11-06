@@ -286,6 +286,77 @@ function tests.successful_pull_from_point_returns_to_camp_without_resetting_posi
     assert(puller:get_camp_position() == camp and puller:get_pull_point() == point, 'both saved positions must survive each pull')
 end
 
+function tests.outbound_does_not_replace_the_pulled_mob_after_return_or_during_melee()
+    local puller, player, queue, ended = pull_point_fixture()
+    puller:set_pull_point({ 20, 20, 0 })
+    local pulled = { id = 1, index = 1, x = 12, y = 20, distance = 4, hpp = 100, status = 1, claimed = true }
+    local fresh = { id = 2, index = 2, x = 25, y = 20, distance = 225, hpp = 100, status = 0 }
+    local original_target = { get_mob = function() return pulled end }
+    puller.target = original_target
+    puller.get_all_targets = function() return L{ fresh } end
+    Condition.check_conditions = function(conditions, index)
+        if conditions[1].kind == 'aggroed' then return false end
+        if conditions[1].kind == 'unclaimed' then return index == 2 end
+        return true
+    end
+    local replacements = 0
+    puller.set_pull_target = function(self, target)
+        replacements = replacements + 1
+        self.target = target
+    end
+    Monster = { new = function() return { get_mob = function() return fresh end } end }
+    player.position = { 14, 20, 0 }
+    ended:trigger({ getidentifier = function() return 'puller_action' end }, true)
+    player.position = { 10, 20, 0 }
+    ended:trigger({ getidentifier = function() return 'Return to camp' end }, true)
+    assert(puller:should_wait_for_first_hit())
+    assert(not puller:move_to_pull_point(), 'arrival must not restart outbound movement before the first hit')
+    assert(replacements == 0 and puller:get_pull_target() == original_target, 'the pulled mob must remain selected after return even before aggro tracking catches up')
+    player.get_status = function() return 'Engaged' end
+    WindowerEvents.Action:trigger({ actor_id = 100, category = 1, targets = {
+        { id = 1, actions = { { message = 1 } } },
+    } })
+    assert(not puller:should_wait_for_first_hit())
+    assert(not puller:move_to_pull_point(), 'landing the first hit must not restart outbound selection during combat')
+    assert(replacements == 0 and puller:get_pull_target() == original_target, 'melee must not switch to a fresh mob')
+    player.get_status = function() return 'Idle' end
+    assert(not puller:move_to_pull_point(), 'a brief Idle status must not restart outbound travel while the pulled mob is still claimed')
+    assert(replacements == 0 and puller:get_pull_target() == original_target, 'a claimed target must remain selected until the fight is resolved')
+    assert(#queue.actions == 1, 'only the return action should have been queued')
+end
+
+function tests.outbound_never_retargets_while_returning_or_engaged()
+    local puller, player = pull_point_fixture()
+    puller:set_pull_point({ 20, 20, 0 })
+    local original = { get_mob = function() return { id = 1, index = 1, distance = 900, hpp = 100 } end }
+    puller.target = original
+    puller.get_all_targets = function() return L{ { id = 2, index = 2, distance = 100, hpp = 100 } } end
+    puller.set_pull_target = function() error('outbound target selection must not run in this phase') end
+    puller.returning_to_camp = true
+    assert(not puller:move_to_pull_point())
+    puller.returning_to_camp = false
+    player.get_status = function() return 'Engaged' end
+    assert(not puller:move_to_pull_point())
+    assert(puller:get_in_range_pull_target() == nil, 'early-pull selection must be disabled while engaged')
+end
+
+function tests.target_refresh_keeps_the_pulled_mob_until_its_first_hit()
+    local puller, player, _, ended = pull_point_fixture()
+    puller:set_pull_point({ 20, 20, 0 })
+    local mob = { id = 1, index = 1, distance = 1600, hpp = 100, status = 1 }
+    local pulled_target = { get_mob = function() return mob end }
+    puller.target = pulled_target
+    player.position = { 15, 20, 0 }
+    ended:trigger({ getidentifier = function() return 'puller_action' end }, true)
+    player.position = { 10, 20, 0 }
+    ended:trigger({ getidentifier = function() return 'Return to camp' end }, true)
+    puller.is_valid_target = function() return false end
+    puller.get_next_target = function() error('must not select a fresh mob while waiting for the pulled mob to reach camp') end
+    logger = { notice = function() end }
+    puller:check_target()
+    assert(puller:get_pull_target() == pulled_target and puller:should_wait_for_first_hit(), 'temporary range or claim tracking gaps must not replace the pulled mob')
+end
+
 function tests.pull_point_selects_only_mobs_reachable_from_that_point()
     local puller = pull_point_fixture()
     puller:set_pull_point({ 20, 20, 0 })

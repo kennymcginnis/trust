@@ -192,11 +192,15 @@ end
 
 function Puller:get_in_range_pull_target()
     if not self:is_enabled() or self.action_queue.is_singing or self.returning_to_camp
+            or self:get_party():get_player():get_status() ~= 'Idle' or self:should_wait_for_first_hit()
             or not self:check_delay() or self:get_auto_pull_range() <= 1 then
         return nil
     end
     local target = self:get_pull_target()
     local mob = target and target:get_mob()
+    if mob and not Condition.check_conditions(L{ UnclaimedCondition.new() }, mob.index) then
+        return nil
+    end
     if self:is_in_pull_range(mob) then
         return mob
     end
@@ -218,12 +222,19 @@ function Puller:can_move_to_pull_point(point, camp)
     if math.sqrt((point[1] - camp[1])^2 + (point[2] - camp[2])^2) > 35 then
         return false
     end
+    local target = self:get_pull_target()
+    local mob = target and target:get_mob()
+    if mob and not Condition.check_conditions(L{ UnclaimedCondition.new() }, mob.index) then
+        return false
+    end
     return self:get_outbound_aggro_target() == nil and self:get_in_range_pull_target() == nil
 end
 
 function Puller:move_to_pull_point()
     local point = self:get_pull_point()
-    if not point or not self:is_pull_to_camp_enabled() then
+    if not point or not self:is_pull_to_camp_enabled() or not self:is_enabled()
+            or self.action_queue.is_singing or self.returning_to_camp
+            or self:get_party():get_player():get_status() ~= 'Idle' or self:should_wait_for_first_hit() then
         return false
     end
     local camp = self:get_camp_position()
@@ -241,6 +252,9 @@ function Puller:move_to_pull_point()
         end
         self:return_to_camp(true)
         return true
+    end
+    if mob then
+        return false
     end
     local in_range_target = self:get_in_range_pull_target()
     if in_range_target then
@@ -329,7 +343,8 @@ function Puller:target_change(target_index)
 end
 
 function Puller:check_target(target_id_blacklist)
-    if state.AutoPullMode.value == 'Off' or self.returning_to_camp and self:is_pull_to_camp_enabled() then
+    if state.AutoPullMode.value == 'Off' or self:is_pull_to_camp_enabled()
+            and (self.returning_to_camp or self:should_wait_for_first_hit()) then
         return
     end
 
