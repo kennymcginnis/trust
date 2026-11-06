@@ -22,6 +22,9 @@ function RunToAction.new(target_index, distance, force_perform)
 end
 
 function RunToAction:destroy()
+	if self.revalidate_while_running then
+		windower.ffxi.run(false)
+	end
 	Action.destroy(self)
 
 	self.dispose_bag:destroy()
@@ -49,7 +52,7 @@ function RunToAction:perform()
 	self.dispose_bag:add(Renderer.shared():onPrerender():addAction(function()
 		local target = windower.ffxi.get_mob_by_index(self.target_index)
 
-		if self:is_cancelled() or target == nil then
+		if self:is_cancelled() or target == nil or self.revalidate_while_running and not self:validate() then
 			windower.ffxi.run(false)
 			self:complete(false)
 			return

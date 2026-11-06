@@ -146,11 +146,12 @@ function Puller:approach_pull_target()
             range = math.max(range, gambit:getAbility():get_range())
         end
     end
-    if range <= 0 or math.sqrt(mob.distance) <= range then
+    if range < 15.5 or math.sqrt(mob.distance) <= range then
         return false
     end
-    local action = RunToAction.new(mob.index, math.max(0.1, range - 0.5))
+    local action = RunToAction.new(mob.index, range - 0.5)
     action.identifier = 'Approach pull target'
+    action.revalidate_while_running = true
     action.priority = self:get_priority()
     action.validate = function()
         local current_target = self:get_pull_target()
@@ -159,6 +160,7 @@ function Puller:approach_pull_target()
                 and not self.returning_to_camp and self:get_party():get_player():get_status() == 'Idle'
                 and current_mob and current_mob.index == mob.index and self:is_valid_target(current_mob)
                 and Condition.check_conditions(L{ UnclaimedCondition.new() }, current_mob.index)
+                and not Condition.check_conditions(L{ AggroedCondition.new() }, current_mob.index)
     end
     self.action_queue:push_action(action, true)
     return true
@@ -218,7 +220,13 @@ function Puller:get_all_targets()
             local index_b = target_names:indexOf(b.name)
             if index_a == -1 then index_a = math.huge end
             if index_b == -1 then index_b = math.huge end
-            return index_a < index_b
+            if index_a ~= index_b then
+                return index_a < index_b
+            end
+            if a.distance ~= b.distance then
+                return a.distance < b.distance
+            end
+            return a.id < b.id
         end)
         return mobs
     end
@@ -268,11 +276,7 @@ function Puller:get_next_target(target_id_blacklist)
         return not target_id_blacklist:contains(target.id) and self:is_valid_target(target)
     end)
     if all_targets:length() > 0 then
-        if state.PullActionMode.value == 'Target' or self.max_num_targets > 1 then
-            return Monster.new(all_targets:random().id)
-        else
-            return Monster.new(all_targets[1].id)
-        end
+        return Monster.new(all_targets[1].id)
     else
         return nil
     end

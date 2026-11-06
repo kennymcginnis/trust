@@ -23,6 +23,13 @@ function L(values)
         end
     end
     function values:length() return #self end
+    function values:indexOf(value)
+        for index, candidate in ipairs(self) do
+            if candidate == value then return index end
+        end
+        return -1
+    end
+    function values:random() return self[#self] end
     function values:map(transform)
         local result = L{}
         for _, value in ipairs(self) do table.insert(result, transform(value)) end
@@ -78,7 +85,7 @@ local modules = {
     ['cylibs/battle/engage'] = { new = function() return {} end },
     ['cylibs/conditions/cooldown'] = { set_timestamp = function() end },
     ['cylibs/util/pull_target_util'] = { get_id = function(value) return value end },
-    ['cylibs/battle/monsters/mob_filter'] = { new = function()
+    ['cylibs/battle/monsters/mob_filter'] = { Type = { PartyClaimed = 'claimed', Unclaimed = 'unclaimed' }, new = function()
         return { set_center_position = function(self, position) self.position = position end }
     end },
     ['cylibs/actions/runtolocation'] = {
@@ -150,6 +157,46 @@ local function fixture()
 end
 
 local tests = {}
+function tests.targets_follow_name_priority_then_distance_without_random_selection()
+    local puller = fixture()
+    puller.check_delay = function() return true end
+    puller.is_valid_target = function() return true end
+    puller.target_names = L{ 'Bat', 'Crab' }
+    puller.target_ids = L{}
+    puller.max_num_targets = 6
+    local fresh = L{
+        { id = 1, name = 'Crab', distance = 4 },
+        { id = 3, name = 'Bat', distance = 100 },
+        { id = 2, name = 'Bat', distance = 25 },
+    }
+    puller.mob_filter = {
+        get_aggroed_mobs = function() return L{} end,
+        get_nearby_mobs = function() return fresh end,
+    }
+    Monster = { new = function(id) return { id = id } end }
+    local target = puller:get_next_target()
+    assert(target.id == 2, 'must choose closest Bat before a closer lower-priority Crab, ignoring randomization')
+    state.PullActionMode.value = 'Target'
+    assert(puller:get_next_target().id == 2, 'Target mode must use the same deterministic ordering')
+end
+
+function tests.claimed_aggroed_targets_still_precede_fresh_pulls()
+    local puller = fixture()
+    puller.check_delay = function() return true end
+    puller.is_valid_target = function() return true end
+    puller.target_names = L{ 'Bat', 'Crab' }
+    puller.target_ids = L{}
+    local claimed = { id = 1, name = 'Crab', distance = 1600 }
+    puller.mob_filter = {
+        get_aggroed_mobs = function(_, filters)
+            return filters[1] == 'claimed' and L{ claimed } or L{}
+        end,
+        get_nearby_mobs = function() return L{ { id = 2, name = 'Bat', distance = 4 } } end,
+    }
+    Monster = { new = function(id) return { id = id } end }
+    assert(puller:get_next_target().id == 1, 'claimed aggro must precede even a closer preferred-name fresh pull')
+end
+
 local function distant_pull_fixture(distance)
     local puller, player, queue, ended = fixture()
     local mob = { id = 1, index = 1, distance = distance * distance }
@@ -195,6 +242,48 @@ function tests.auto_pull_movement_respects_range_modes_and_pending_actions()
     assert(puller:approach_pull_target() and #queue.actions == 0, 'must not queue duplicate movement')
     queue.pending = 'puller_action'
     assert(not puller:approach_pull_target(), 'must not approach during an actual pull')
+end
+
+function tests.auto_pull_does_not_run_into_short_range_abilities()
+    local puller, _, queue = distant_pull_fixture(24)
+    puller.pull_abilities.Auto[1].getAbility = function()
+        return { get_range = function() return 3 end }
+    end
+    assert(not puller:approach_pull_target(), 'camp pull must not close to melee range for a short-range ability')
+    assert(#queue.actions == 0, 'short-range pull actions must not cause automatic body pulling')
+end
+
+function tests.running_approach_revalidates_before_sending_movement()
+    local callback
+    local stopped = false
+    local completed
+    local base_action = {
+        new = function() return {} end,
+        is_cancelled = function() return false end,
+        complete = function(_, success) completed = success end,
+    }
+    local dependencies = {
+        ['cylibs/actions/action'] = base_action,
+        ['cylibs/events/dispose_bag'] = { new = function() return { add = function() end } end },
+        ['cylibs/ui/views/render'] = { shared = function() return {
+            onPrerender = function() return { addAction = function(_, action) callback = action end } end,
+        } end },
+    }
+    local environment = setmetatable({
+        require = function(name) return dependencies[name] end,
+        windower = { ffxi = {
+            get_player = function() return { target_locked = false } end,
+            get_mob_by_index = function() return {} end,
+            run = function(value) stopped = value == false end,
+        } },
+    }, { __index = _G })
+    local RunTo = assert(loadfile('cylibs/actions/runto.lua', 't', environment))()
+    local action = RunTo.new(1, 20)
+    action.revalidate_while_running = true
+    action.validate = function() return false end
+    action:perform()
+    callback()
+    assert(stopped and completed == false, 'invalidated active approach must stop before moving toward the mob')
 end
 
 function tests.detection_range_is_independent_of_pull_ability_range()
